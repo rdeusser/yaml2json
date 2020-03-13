@@ -21,7 +21,7 @@ var (
 )
 
 type object struct {
-	data []byte `json:"-"`
+	data []byte
 }
 
 func init() {
