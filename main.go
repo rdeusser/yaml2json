@@ -12,11 +12,21 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-var flagset = flag.NewFlagSet("", flag.ExitOnError)
+var (
+	yamlSeparator = []byte("\n---")
+	docSeparator  = []byte(`\n############## separate here ##############\n`)
+	flagset       = flag.NewFlagSet("", flag.ExitOnError)
 
-var help bool
+	help bool
+)
+
+type object struct {
+	data []byte `json:"-"`
+}
 
 func init() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	flagset.BoolVar(&help, "h", false, "show help message")
 }
 
@@ -58,28 +68,86 @@ func main() {
 }
 
 func convertYAMLToJSON(f *os.File) error {
-	var out bytes.Buffer
-
 	scanner := bufio.NewScanner(f)
+	scanner.Split(splitYAMLDocument)
+
+	documents := make([]*object, 0)
 	for scanner.Scan() {
-		out.Write(scanner.Bytes())
-		out.WriteString("\n")
+		if i := bytes.IndexByte(scanner.Bytes(), '#'); i >= 0 {
+			continue
+		}
+		d := &object{
+			data: append([]byte(nil), scanner.Bytes()...),
+		}
+		documents = append(documents, d)
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("%w", err)
 	}
 
-	jsonObj, err := yaml.YAMLToJSON(out.Bytes())
-	if err != nil {
+	jsonDocuments := make([][]byte, 0)
+
+	for _, doc := range documents {
+		obj, err := yaml.YAMLToJSON(doc.data)
+		if err != nil {
+			return fmt.Errorf("%w", err)
+		}
+		jsonDocuments = append(jsonDocuments, obj)
+	}
+
+	var out bytes.Buffer
+	out.Write(bytes.Join(jsonDocuments, []byte(",")))
+
+	var buf bytes.Buffer
+	if len(jsonDocuments) >= 2 {
+		buf.Write([]byte("["))
+		buf.Write(out.Bytes())
+		buf.Write([]byte("]"))
+	} else {
+		buf.Write(out.Bytes())
+	}
+
+	var data interface{}
+	if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
 		return fmt.Errorf("%w", err)
 	}
 
-	out.Reset() // reset the buffer so we can put our json in there
-	json.Indent(&out, jsonObj, "", "  ")
-
-	fmt.Fprint(os.Stdout, out.String())
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(data); err != nil {
+		return fmt.Errorf("%w", err)
+	}
 
 	return nil
+}
+
+func splitYAMLDocument(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	sep := len(yamlSeparator)
+	if i := bytes.Index(data, yamlSeparator); i >= 0 {
+		// We have a potential document terminator
+		i += sep
+		after := data[i:]
+		if len(after) == 0 {
+			// we can't read any more characters
+			if atEOF {
+				return len(data), data[:len(data)-sep], nil
+			}
+			return 0, nil, nil
+		}
+		if j := bytes.IndexByte(after, '\n'); j >= 0 {
+			return i + j + 1, data[0 : i-sep], nil
+		}
+		return 0, nil, nil
+	}
+	// If we're at EOF, we have a final, non-terminated line. Return it.
+	if atEOF {
+		return len(data), data, nil
+	}
+	// Request more data.
+	return 0, nil, nil
 }
 
 func onStdin() bool {
